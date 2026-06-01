@@ -1,12 +1,19 @@
 # edita
 
-> Open any file or folder in the browser by its real filesystem path — a local, GitHub-style viewer with a built-in code-review mode.
+> A local viewer for **AI coding agents** — see and review the files an agent is working on, right in your browser.
 
-Run one daemon, then point your browser at `http://localhost:3456/<absolute/path>`. Markdown renders beautifully, source code gets syntax highlighting, directories list like a GitHub repo, git history is one click away — and you can run a review session across your whole machine, dropping notes on any line of any file.
+When an AI agent (Claude Code, Cursor, etc.) edits your codebase, edita gives you a window onto exactly those files: open any file or folder by its **real filesystem path**, rendered like a GitHub repo — markdown, syntax-highlighted code, git history, inline diffs. Then start a **review session**, click any line in any file, and leave notes. The notes are written to plain Markdown that the agent reads back to act on your feedback — closing the human-in-the-loop review without leaving the terminal.
 
-Because every page is served at its **real path**, relative links between files just work.
+It's designed to run as an **agent skill**: the agent (or you) starts one long-running daemon, and everything is reachable at `http://localhost:3456/<absolute/path>`. Because every page is served at its real path, relative links between files just work.
 
 *(The name is "edit" in Spanish — inline editing is on the roadmap.)*
+
+## Use with an AI agent
+
+1. The agent starts the daemon once (`edita daemon`) and shares links to the files it touches.
+2. You browse them in the viewer — rendered markdown, highlighted code, git history/diffs.
+3. You hit the review toggle, click lines, and leave notes across as many files as you like.
+4. Notes land in `~/.edita/review-<timestamp>.md` — an agent-readable file the agent reads to apply your feedback.
 
 ## Features
 

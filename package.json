@@ -1,7 +1,7 @@
 {
   "name": "edita",
   "version": "0.1.0",
-  "description": "Open any file or folder in the browser by its real filesystem path — a local GitHub-style viewer. Renders Markdown (Shiki, KaTeX, Mermaid, GFM, frontmatter), syntax-highlights source code, and browses directories with breadcrumbs.",
+  "description": "A local viewer for AI coding agents — see and review the files an agent is working on. Opens any file/folder by its real path (GitHub-style: markdown, syntax-highlighted code, git history, inline diffs) and a review mode whose line-notes are saved as agent-readable Markdown.",
   "type": "module",
   "bin": {
     "edita": "./src/cli.ts"
