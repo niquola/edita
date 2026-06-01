@@ -1,0 +1,45 @@
+{
+  "name": "edita",
+  "version": "0.1.0",
+  "description": "Open any file or folder in the browser by its real filesystem path — a local GitHub-style viewer. Renders Markdown (Shiki, KaTeX, Mermaid, GFM, frontmatter), syntax-highlights source code, and browses directories with breadcrumbs.",
+  "type": "module",
+  "bin": {
+    "edita": "./src/cli.ts"
+  },
+  "scripts": {
+    "daemon": "bun src/cli.ts daemon",
+    "start": "bun src/cli.ts daemon"
+  },
+  "keywords": [
+    "markdown",
+    "viewer",
+    "preview",
+    "shiki",
+    "syntax-highlighting",
+    "katex",
+    "mermaid",
+    "bun",
+    "live-reload"
+  ],
+  "author": "niquola",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/niquola/edita.git"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "dependencies": {
+    "unified": "^11.0.5",
+    "remark-parse": "^11.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-rehype": "^11.1.2",
+    "rehype-raw": "^7.0.0",
+    "rehype-stringify": "^10.0.1",
+    "unist-util-visit": "^5.1.0",
+    "shiki": "^4.0.1",
+    "katex": "^0.16.37",
+    "beautiful-mermaid": "^1.1.3"
+  }
+}
