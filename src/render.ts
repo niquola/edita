@@ -339,9 +339,75 @@ export async function renderSourceFile(code: string, filePath: string, opts: Sou
     return `<div class="cv-row${mark}" id="L${n}"${inter}><span class="cv-num">${n}</span><span class="cv-code">${ln || " "}</span></div>`;
   }).join("");
 
-  const html = `<div class="code-view" data-lang="${escapeHtml(lang)}"><div class="${cls} cv-grid"${style ? ` style="${style}"` : ""}>${rows}</div></div>`;
+  const html = `<div class="code-view" data-lang="${escapeHtml(lang)}"><div class="${cls} cv-grid"${style ? ` style="${style}"` : ""}>${rows}</div></div>${LINE_HASH_SCRIPT}`;
   return { html, title: path.basename(filePath), lang };
 }
+
+// Client script: deep-link to lines via the URL hash. Segments are ";"-separated;
+// each is  L<a>[-<b>][C<c1>-<c2>][@word][:comment]  (word & comment URL-encoded):
+//   #L42                 → highlight line 42
+//   #L42-45              → highlight a range
+//   #L42@foo             → highlight + underline every "foo" on the line
+//   #L42C5-12            → highlight + underline columns 5–12 (exact spot)
+//   #L42-45:comment      → highlight + inline annotation
+//   #L42@foo:fix this    → highlight + underline "foo" + annotation
+//   #L10:a;L80C3-9:b     → multiple
+const LINE_HASH_SCRIPT = `<script>(function(){
+function textNodes(row){
+  var code=row.querySelector(".cv-code"); if(!code) return [];
+  var w=document.createTreeWalker(code,NodeFilter.SHOW_TEXT,null),out=[],tn;
+  while(tn=w.nextNode()) out.push(tn); return out;
+}
+function wrap(t,i0,i1){ // wrap chars [i0,i1) of text node t in <span class=cv-uline>
+  var s=t.nodeValue,frag=document.createDocumentFragment();
+  if(i0>0)frag.appendChild(document.createTextNode(s.slice(0,i0)));
+  var mk=document.createElement("span");mk.className="cv-uline";mk.textContent=s.slice(i0,i1);frag.appendChild(mk);
+  if(i1<s.length)frag.appendChild(document.createTextNode(s.slice(i1)));
+  t.parentNode.replaceChild(frag,t);
+}
+function ulineWord(row,word){
+  textNodes(row).forEach(function(t){
+    var s=t.nodeValue,i=s.indexOf(word); if(i<0||!word) return;
+    var parts=[],last=0;
+    while(i>=0){parts.push([i,i+word.length]);last=i+word.length;i=s.indexOf(word,last);}
+    // wrap from the end so earlier offsets stay valid (single wrap per node here is enough)
+    wrap(t,parts[0][0],parts[0][1]);
+  });
+}
+function ulineCols(row,c1,c2){ // 1-based inclusive columns across the whole line
+  var col=1;
+  textNodes(row).forEach(function(t){
+    var len=t.nodeValue.length,start=col,end=col+len-1;
+    var from=Math.max(c1,start),to=Math.min(c2,end);
+    if(from<=to) wrap(t,from-start,to-start+1);
+    col+=len;
+  });
+}
+function apply(){
+  document.querySelectorAll(".cv-hl").forEach(function(e){e.classList.remove("cv-hl")});
+  document.querySelectorAll(".cv-annot").forEach(function(e){e.remove()});
+  document.querySelectorAll(".cv-uline").forEach(function(s){s.replaceWith(document.createTextNode(s.textContent))});
+  var raw=location.hash.slice(1); if(!raw) return; var first=null;
+  raw.split(";").forEach(function(seg){
+    var m=seg.match(/^L(\\d+)(?:-L?(\\d+))?(?:C(\\d+)-(\\d+))?(?:@([^:]*))?(?::([\\s\\S]*))?$/); if(!m) return;
+    var a=+m[1],e=m[2]?+m[2]:a,lo=Math.min(a,e),hi=Math.max(a,e);
+    var c1=m[3]?+m[3]:0,c2=m[4]?+m[4]:0,word=m[5]?decodeURIComponent(m[5]):"",top=null;
+    for(var n=lo;n<=hi;n++){var el=document.getElementById("L"+n); if(el){el.classList.add("cv-hl"); if(word)ulineWord(el,word); if(!top)top=el;}}
+    if(c1&&c2){var cel=document.getElementById("L"+a); if(cel)ulineCols(cel,c1,c2);}
+    if(!top) return;
+    var anchor=top;
+    if(m[6]){
+      var d=document.createElement("div");d.className="cv-annot";
+      var lab=document.createElement("b");lab.className="cv-annot-loc";lab.textContent=(lo===hi?"L"+lo:"L"+lo+"-"+hi)+"  ";
+      d.appendChild(lab);d.appendChild(document.createTextNode(decodeURIComponent(m[6])));
+      top.insertAdjacentElement("beforebegin",d);anchor=d;
+    }
+    if(!first)first=anchor;
+  });
+  if(first) first.scrollIntoView({block:"center"});
+}
+addEventListener("hashchange",apply); apply();
+})();</script>`;
 
 export async function renderMarkdown(content: string, opts: RenderOptions = {}): Promise<{ html: string; toc: TocItem[]; title: string }> {
   const hl = await getHighlighter();
@@ -421,6 +487,8 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
       max-width: 1200px; margin: 0 auto; padding: 1.5rem 1.5rem 4rem;
       line-height: 1.7; font-size: 17px;
     }
+    /* Code / directory / history views use the whole window width (markdown keeps its reading width) */
+    body:has(.code-view), body:has(.ghdir), body:has(.githist) { max-width: none; }
     /* Breadcrumb — filesystem path above the document */
     .breadcrumb {
       font-size: 0.82em; color: var(--muted); margin-bottom: 1.5rem;
@@ -593,6 +661,14 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
     .code-view .cv-row:hover .cv-num { opacity: 0.9; }
     .code-view .cv-code { white-space: pre; flex: 1 1 auto; padding-right: 1em; }
     .code-view .cv-sel { background: color-mix(in srgb, var(--accent) 16%, transparent) !important; }
+    .code-view .cv-hl { background: color-mix(in srgb, #ffd33d 16%, transparent) !important; }
+    .code-view .cv-annot {
+      margin: 0; padding: 0.5em 1em; border-left: 3px solid #d4a200;
+      background: #ffe169; color: #3d2e00;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 0.9em; white-space: pre-wrap;
+    }
+    .code-view .cv-annot-loc { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; opacity: 0.65; }
+    .code-view .cv-uline { text-decoration: underline; text-decoration-color: #d4a200; text-decoration-thickness: 2px; text-underline-offset: 2px; background: color-mix(in srgb, #ffd33d 28%, transparent); border-radius: 2px; }
     .code-view .cv-reviewed .cv-num { color: var(--accent); opacity: 1; font-weight: 600; }
     .code-view .cv-reviewed .cv-num::after { content: "▌"; margin-left: 0.15em; }
     .katex-display { margin: 1em 0; overflow-x: auto; }

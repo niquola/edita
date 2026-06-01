@@ -10,10 +10,25 @@ It's designed to run as an **agent skill**: the agent (or you) starts one long-r
 
 ## Use with an AI agent
 
-1. The agent starts the daemon once (`edita daemon`) and shares links to the files it touches.
+1. The agent opens the files it's working on with `edita open <file>` (starts the daemon if needed) — and can point at exact spots with line/word/column anchors.
 2. You browse them in the viewer — rendered markdown, highlighted code, git history/diffs.
 3. You hit the review toggle, click lines, and leave notes across as many files as you like.
 4. Notes land in `~/.edita/review-<timestamp>.md` — an agent-readable file the agent reads to apply your feedback.
+
+### Pointing at exact spots
+
+`edita open <file>` takes anchors that highlight, underline, and annotate precise locations (in a URL they're the `#` hash, `;`-separated): `L<a>[-<b>][C<c1>-<c2>][@word][:comment]`.
+
+```bash
+edita open src/app.ts L42                          # highlight line 42
+edita open src/app.ts L42-45                        # highlight a range
+edita open src/app.ts 'L42@fetchUser'               # underline the word "fetchUser"
+edita open src/app.ts 'L42C5-12'                    # underline exact columns 5–12
+edita open src/app.ts 'L42-45:extract this helper'  # highlight + a note above the lines
+edita open src/app.ts 'L10:first' 'L80@auth:second' # several spots at once
+```
+
+The note shows as a bright-yellow callout (prefixed with the line range) above the lines; words/columns get an amber underline.
 
 ## Features
 
@@ -88,6 +103,7 @@ bun src/cli.ts serve ./docs 4000           # dev server scoped to a path
 
 | Command | Description |
 |---------|-------------|
+| `open <file-or-dir> [anchors…]` | Open in the browser (starts the daemon if needed). Anchors `L<a>[-<b>][C<c1>-<c2>][@word][:comment]` highlight / underline / annotate. |
 | `daemon [port]` | Long-running viewer; open any file/folder at its real path (default port: `3456`). |
 | `daemon status` / `daemon stop` | Inspect / shut down the running daemon. |
 | `render <file.md> [output.html]` | Render a markdown file to standalone HTML. |
@@ -107,17 +123,9 @@ extract this into a helper
 broken link here
 ```
 
-## How it works
+## Built with
 
-```
-Markdown → frontmatter strip → Mermaid → KaTeX
-        → remark-parse → remark-gfm → remark-rehype → rehype-raw
-        → headings (TOC + anchors) → external links → Shiki → HTML
-```
-
-Non-markdown text files skip the pipeline and render as a Shiki code view. The daemon maps each request's URL path directly to a filesystem path: a directory yields a listing, a text file is rendered, everything else is streamed raw. Git history/diffs come from `git log`/`git show`; review state lives in `~/.edita/`. Interactivity uses htmx (history diffs) and Datastar (review mode); both stream Server-Sent Events.
-
-Built on [unified](https://unifiedjs.com/) / remark / rehype, [Shiki](https://shiki.style), [KaTeX](https://katex.org), [beautiful-mermaid](https://www.npmjs.com/package/beautiful-mermaid), [htmx](https://htmx.org) and [Datastar](https://data-star.dev). YAML frontmatter is parsed with Bun's native `Bun.YAML`.
+[Bun](https://bun.sh), [unified](https://unifiedjs.com/) / remark / rehype, [Shiki](https://shiki.style), [KaTeX](https://katex.org), [beautiful-mermaid](https://www.npmjs.com/package/beautiful-mermaid), [htmx](https://htmx.org) (inline history diffs) and [Datastar](https://data-star.dev) (review mode).
 
 ## License
 

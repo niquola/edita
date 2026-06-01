@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 
 // edita — open any file or folder in the browser by its real filesystem path.
-// Usage: bun cli.ts daemon [port]                     — long-running viewer (path-as-URL)
+// Usage: bun cli.ts open <file> [L42-45:comment ...]  — open in the browser (starts daemon)
+//        bun cli.ts daemon [port]                     — long-running viewer (path-as-URL)
 //        bun cli.ts render <file.md> [output.html]    — render a markdown file to HTML
-//        bun cli.ts serve <file-or-dir> [port]        — dev server scoped to a path
 
 import { renderMarkdown, renderSourceFile, wrapHtml, buildBreadcrumb } from "./render";
 import path from "path";
@@ -207,8 +207,11 @@ function notesHtml(notes: Note[]): string {
       `<span class="rv-group-dir">${esc(path.dirname(p))}</span></div>`;
     for (const { note, idx } of items) {
       const comment = esc(note.comment).replace(/\n/g, "<br>");
+      // Deep-link opens the file, highlights the lines and shows the note inline (#L..:comment).
+      const range = note.end > note.start ? `L${note.start}-${note.end}` : `L${note.start}`;
+      const href = `${encodeURI(p)}#${range}:${encodeURIComponent(note.comment)}`;
       out += `<div class="rv-note"><div class="rv-note-top">` +
-        `<a class="rv-note-loc" href="${encodeURI(p)}#L${note.start}">${noteRange(note)}</a>` +
+        `<a class="rv-note-loc" href="${href}">${noteRange(note)}</a>` +
         `<button class="rv-del" data-on-click="@post('/__review/del?i=${idx}')" title="Delete note">×</button>` +
         `</div><div class="rv-note-text">${comment}</div></div>`;
     }
@@ -779,6 +782,45 @@ async function daemonStop() {
   try { fs.unlinkSync(DAEMON_PORT_FILE); } catch {}
 }
 
+// ── Open command ── (open a file/folder in the browser via the daemon)
+
+// Build a URL hash from line specs like "L42-45:fix naming" → "L42-45:fix%20naming",
+// joined with ";". The comment part is URL-encoded so spaces/punctuation survive.
+function buildLineHash(specs: string[]): string {
+  const parts = specs.map((s) => {
+    const m = s.match(/^L?(\d+)(?:-(\d+))?(?:C(\d+)-(\d+))?(?:@([^:]*))?(?::([\s\S]*))?$/);
+    if (!m) return "";
+    let out = m[2] ? `L${m[1]}-${m[2]}` : `L${m[1]}`;
+    if (m[3] && m[4]) out += `C${m[3]}-${m[4]}`;
+    if (m[5]) out += `@${encodeURIComponent(m[5])}`;
+    if (m[6]) out += `:${encodeURIComponent(m[6])}`;
+    return out;
+  }).filter(Boolean);
+  return parts.length ? "#" + parts.join(";") : "";
+}
+
+async function openCmd(target: string, lineSpecs: string[]) {
+  const abs = path.resolve(target);
+  if (!fs.existsSync(abs)) { console.error(`Not found: ${abs}`); process.exit(1); }
+
+  // Ensure a daemon is up; if not, start one detached and wait for its port file.
+  let pid = fs.existsSync(DAEMON_PID_FILE) ? parseInt(await Bun.file(DAEMON_PID_FILE).text()) : 0;
+  if (!pid || !isAlive(pid)) {
+    console.log("[edita] starting daemon…");
+    const proc = Bun.spawn(["bun", `${SCRIPTS_DIR}/cli.ts`, "daemon"], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+    proc.unref();
+    for (let i = 0; i < 40 && !(fs.existsSync(DAEMON_PID_FILE) && isAlive(parseInt(await Bun.file(DAEMON_PID_FILE).text()))); i++) {
+      await Bun.sleep(100);
+    }
+  }
+  const port = fs.existsSync(DAEMON_PORT_FILE) ? (await Bun.file(DAEMON_PORT_FILE).text()).trim() : String(DEFAULT_DAEMON_PORT);
+
+  const url = `http://localhost:${port}${encodeURI(abs)}${buildLineHash(lineSpecs)}`;
+  const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  try { Bun.spawn([opener, url], { stdout: "ignore", stderr: "ignore" }); } catch {}
+  console.log(url);
+}
+
 
 // ── Main ──
 
@@ -806,18 +848,25 @@ switch (command) {
     await daemonStart(Number.isFinite(port) ? port : DEFAULT_DAEMON_PORT);
     break;
   }
+  case "open": {
+    const target = args[0];
+    if (!target) { console.error("Usage: edita open <file-or-dir> [L42-45[:comment] ...]"); process.exit(1); }
+    await openCmd(target, args.slice(1));
+    break;
+  }
   default:
     console.log(`edita — open any file or folder in the browser
 
 Usage:
-  edita daemon [port]                     Long-running viewer; open any file at http://localhost:3456/<abs/path>
-  edita daemon status                     Show daemon pid and URL
-  edita daemon stop                       Stop running daemon
-  edita render <file.md> [output.html]    Render a markdown file to standalone HTML
-  edita serve <file-or-dir> [port]        Dev server scoped to a path, with live-reload (default: 3456)
+  edita open <file-or-dir> [L42-45[:comment] ...]   Open in the browser (starts daemon if needed; highlights lines)
+  edita daemon [port]                               Long-running viewer (default: 3456)
+  edita daemon status                               Show daemon pid and URL
+  edita daemon stop                                 Stop running daemon
+  edita render <file.md> [output.html]              Render a markdown file to standalone HTML
+  edita serve <file-or-dir> [port]                  Dev server scoped to a path, with live-reload
 
 Examples:
-  edita daemon                            → open http://localhost:3456/Users/me/project/README.md
-  edita render README.md                  → README.html
-  edita serve ./docs 4000                 → http://localhost:4000`);
+  edita open src/app.ts                             → opens http://localhost:3456/…/src/app.ts
+  edita open src/app.ts L42-45:"fix this" L80       → opens with lines highlighted + annotated
+  edita render README.md                            → README.html`);
 }
