@@ -2,8 +2,8 @@
 
 // edita — open any file or folder in the browser by its real filesystem path.
 // Usage: bun cli.ts open <file> [L42-45:comment ...]  — open in the browser (starts daemon)
-//        bun cli.ts daemon [port]                     — long-running viewer (path-as-URL)
-//        bun cli.ts render <file.md> [output.html]    — render a markdown file to HTML
+//        bun cli.ts review start|open|notes|stop      — drive a code-review session
+//        bun cli.ts daemon [port]                     — long-running viewer
 
 import { renderMarkdown, renderSourceFile, wrapHtml, buildBreadcrumb } from "./render";
 import path from "path";
@@ -854,19 +854,48 @@ switch (command) {
     await openCmd(target, args.slice(1));
     break;
   }
+  case "review": {
+    const sub = args[0] || "status";
+    if (sub === "start") {
+      const f = startReview();
+      console.log(`[edita] review started → ${f}`);
+    } else if (sub === "stop" || sub === "finish") {
+      const f = activeReviewFile();
+      stopReview();
+      console.log(f ? `[edita] review finished → ${f}` : "[edita] no active review");
+    } else if (sub === "status") {
+      const f = activeReviewFile();
+      console.log(f ? `[edita] reviewing → ${f}  (${readNotes(f).length} note(s))` : "[edita] no active review");
+    } else if (sub === "path") {
+      const f = activeReviewFile();
+      if (f) console.log(f); else process.exit(1);
+    } else if (sub === "notes" || sub === "show") {
+      const f = activeReviewFile();
+      if (f) process.stdout.write(await Bun.file(f).text()); else { console.error("[edita] no active review"); process.exit(1); }
+    } else if (sub === "open") {
+      const f = activeReviewFile();
+      if (!f) { console.error("[edita] no active review — run `edita review start`"); process.exit(1); }
+      await openCmd(f, args.slice(1));
+    } else {
+      console.error("Usage: edita review <start|stop|status|open|path|notes>"); process.exit(1);
+    }
+    break;
+  }
   default:
     console.log(`edita — open any file or folder in the browser
 
 Usage:
   edita open <file-or-dir> [L42-45[:comment] ...]   Open in the browser (starts daemon if needed; highlights lines)
+  edita review start                                Start a system-wide review session
+  edita review open                                 Open the active review file in the browser
+  edita review status | path | notes | stop         Inspect / read / finish the review
   edita daemon [port]                               Long-running viewer (default: 3456)
-  edita daemon status                               Show daemon pid and URL
-  edita daemon stop                                 Stop running daemon
+  edita daemon status | stop                        Inspect / stop the daemon
   edita render <file.md> [output.html]              Render a markdown file to standalone HTML
   edita serve <file-or-dir> [port]                  Dev server scoped to a path, with live-reload
 
 Examples:
-  edita open src/app.ts                             → opens http://localhost:3456/…/src/app.ts
   edita open src/app.ts L42-45:"fix this" L80       → opens with lines highlighted + annotated
-  edita render README.md                            → README.html`);
+  edita review start && edita open src/app.ts        → review mode; user clicks lines to leave notes
+  edita review notes                                → print the collected review for the agent to apply`);
 }
