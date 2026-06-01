@@ -16,6 +16,7 @@ import { createHighlighter, type Highlighter, type BundledLanguage } from "shiki
 import katex from "katex";
 import { renderMermaid } from "beautiful-mermaid";
 import path from "path";
+import fs from "fs";
 import type { Root } from "mdast";
 import type { Element } from "hast";
 
@@ -25,6 +26,8 @@ export interface RenderOptions {
   filePath?: string;
   /** Rewrite local links + breadcrumb segments to the daemon's `/markdown?path=` endpoint. */
   daemon?: boolean;
+  /** Current view tab — "preview" | "code" | "source" (drives the tab bar highlight). */
+  view?: string;
 }
 
 // ── Shiki highlighter ──
@@ -273,6 +276,7 @@ function scalarToString(v: unknown): string {
 // ── Source-file rendering (highlight any code file, not just fenced blocks) ──
 
 const EXT_LANG: Record<string, BundledLanguage | "plaintext"> = {
+  md: "markdown", markdown: "markdown",
   ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript",
   js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
   json: "json", jsonc: "json", json5: "json",
@@ -350,6 +354,7 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
     : "";
 
   const breadcrumbHtml = buildBreadcrumb(opts);
+  const tabsHtml = buildTabs(opts);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -388,6 +393,45 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
     .breadcrumb a:hover { color: var(--link); text-decoration: none; }
     .breadcrumb .sep { margin: 0 0.4em; opacity: 0.45; }
     .breadcrumb .crumb-current { color: var(--fg); font-weight: 600; }
+    /* View tabs — Preview / Source / Code / Raw */
+    .tabs { display: flex; gap: 0.25rem; margin: -0.5rem 0 1.75rem; border-bottom: 1px solid var(--border); }
+    .tabs .tab {
+      padding: 0.45em 0.9em; font-size: 0.85em; color: var(--muted); text-decoration: none;
+      border-bottom: 2px solid transparent; margin-bottom: -1px; border-radius: 6px 6px 0 0;
+    }
+    .tabs .tab:hover { color: var(--fg); background: var(--surface); text-decoration: none; }
+    .tabs .tab.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent); }
+    /* Git history view */
+    .githist { margin: 0; }
+    .githist ol { list-style: none; padding: 0; margin: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .githist li { padding: 0.7em 1em; border-bottom: 1px solid var(--border); }
+    .githist li:last-child { border-bottom: none; }
+    .githist li:nth-child(even) { background: var(--surface); }
+    .githist .gh-msg { font-weight: 600; margin-bottom: 0.2em; }
+    .githist .gh-meta { font-size: 0.85em; color: var(--muted); display: flex; gap: 0.6em; flex-wrap: wrap; align-items: center; }
+    .githist .gh-hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); padding: 0.05em 0.5em; border-radius: 4px; color: var(--fg); }
+    .githist .gh-empty { color: var(--muted); }
+    .githist .gh-difftoggle {
+      cursor: pointer; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px;
+      padding: 0.05em 0.55em; font-size: 0.95em; color: var(--link); font-family: inherit;
+    }
+    .githist .gh-difftoggle:hover { border-color: var(--link); }
+    .githist .gh-difftoggle.htmx-request { opacity: 0.5; }
+    .githist .gh-diff:not(:empty) { margin-top: 0.6em; }
+    /* Unified diff rendering */
+    .diff { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.5em 0; overflow-x: auto; font-size: 12.5px; line-height: 1.5; margin: 0; }
+    .diff .dline { display: block; padding: 0 1em; white-space: pre; }
+    .diff .d-add { background: rgba(46,160,67,0.18); }
+    .diff .d-del { background: rgba(248,81,73,0.18); }
+    .diff .d-hunk { color: var(--accent); }
+    .diff .d-file, .diff .d-meta { color: var(--muted); }
+    /* Directory listing */
+    .dirlist { border-collapse: collapse; width: 100%; margin: 0; }
+    .dirlist th, .dirlist td { text-align: left; padding: 0.4em 0.8em; border-bottom: 1px solid var(--border); }
+    .dirlist th { background: var(--surface); font-weight: 600; font-size: 0.85em; }
+    .dirlist tr:nth-child(even) { background: transparent; }
+    .dirlist td:first-child { width: 1.5em; text-align: center; }
+    .dirlist td:nth-child(3), .dirlist td:nth-child(4) { font-size: 0.85em; color: var(--muted); white-space: nowrap; }
     /* Two-column layout: content + sticky TOC sidebar on the right */
     .layout { display: flex; gap: 2.5rem; align-items: flex-start; }
     .prose { flex: 1 1 auto; min-width: 0; max-width: 820px; }
@@ -492,6 +536,7 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
 </head>
 <body>
 ${breadcrumbHtml}
+${tabsHtml}
 <div class="layout">
 <article class="prose">
 ${body}
@@ -504,27 +549,82 @@ ${tocHtml}
 
 // ── Breadcrumb ──
 
-/** Build a clickable filesystem-path breadcrumb above the document. */
+// Octicons git-branch (16px), inline + currentColor so it themes with the breadcrumb.
+const GIT_ICON = `<svg class="git-root" viewBox="0 0 16 16" width="1em" height="1em" fill="#f05133" aria-hidden="true" title="git repository" style="vertical-align:-0.12em;margin-right:0.25em"><path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z"></path></svg>`;
+
+/** Build the view-switcher tab bar for daemon-served files & directories. */
+function buildTabs(opts: RenderOptions): string {
+  if (!opts.daemon || !opts.filePath) return "";
+  const base = escapeHtml(encodeURI(opts.filePath));
+  let isDir = false;
+  try { isDir = fs.statSync(opts.filePath).isDirectory(); } catch {}
+
+  // [label, view-id, href]
+  let tabs: [string, string, string][];
+  let current: string;
+  if (isDir) {
+    current = opts.view || "files";
+    tabs = [["Files", "files", base]];
+    if (inGitRepo(opts.filePath)) tabs.push(["History", "history", `${base}?view=history`]);
+  } else {
+    const isMd = /\.(md|markdown)$/i.test(opts.filePath);
+    current = opts.view || (isMd ? "preview" : "code");
+    tabs = isMd
+      ? [["Preview", "preview", base], ["Source", "source", `${base}?view=source`]]
+      : [["Code", "code", base]];
+    if (inGitRepo(opts.filePath)) tabs.push(["History", "history", `${base}?view=history`]);
+    tabs.push(["Raw", "raw", `${base}?view=raw`]);
+  }
+
+  const items = tabs.map(([label, view, href]) => {
+    const active = view === current ? " active" : "";
+    return `<a class="tab${active}" href="${href}">${label}</a>`;
+  }).join("");
+
+  return `<nav class="tabs">${items}</nav>`;
+}
+
+/** A directory is a git root if it directly contains a `.git` entry. */
+function isGitRoot(dir: string): boolean {
+  try { return fs.existsSync(path.join(dir, ".git")); } catch { return false; }
+}
+
+/** Is the path inside a git working tree (walks up to the filesystem root)? */
+function inGitRepo(filePath: string): boolean {
+  let dir: string;
+  try { dir = fs.statSync(filePath).isDirectory() ? filePath : path.dirname(filePath); }
+  catch { dir = path.dirname(filePath); }
+  for (let i = 0; i < 64; i++) {
+    if (isGitRoot(dir)) return true;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return false;
+}
+
+/** Build a clickable filesystem-path breadcrumb above the document.
+ *  Directory segments that are git roots get a git-branch icon. */
 export function buildBreadcrumb(opts: RenderOptions): string {
   if (!opts.filePath) return "";
   const parts = opts.filePath.split("/").filter(Boolean);
   if (parts.length === 0) return "";
 
   const sep = `<span class="sep">›</span>`;
-  const dirLink = (abs: string, label: string) =>
-    opts.daemon
-      ? `<a href="${escapeHtml(encodeURI(abs))}">${escapeHtml(label)}</a>`
-      : `<span>${escapeHtml(label)}</span>`;
+  const link = (abs: string, inner: string) =>
+    opts.daemon ? `<a href="${escapeHtml(encodeURI(abs))}">${inner}</a>` : inner;
+  const icon = (dir: string) => (isGitRoot(dir) ? GIT_ICON : "");
 
   // Root ("/") segment first.
-  const pieces: string[] = [dirLink("/", "/")];
+  const pieces: string[] = [link("/", "/")];
   let acc = "";
   parts.forEach((part, i) => {
     acc += "/" + part;
+    const inner = icon(acc) + escapeHtml(part);
     if (i === parts.length - 1) {
-      pieces.push(`<span class="crumb-current">${escapeHtml(part)}</span>`);
+      pieces.push(`<span class="crumb-current">${inner}</span>`);
     } else {
-      pieces.push(dirLink(acc, part));
+      pieces.push(link(acc, inner));
     }
   });
 

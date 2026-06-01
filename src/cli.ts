@@ -15,6 +15,59 @@ const DAEMON_PID_FILE = `${TMP_DIR}/daemon.pid`;
 const DAEMON_PORT_FILE = `${TMP_DIR}/daemon.port`;
 const DEFAULT_DAEMON_PORT = 3456;
 
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// Read a file's git commit history (most recent first; follows renames).
+async function gitLog(filePath: string): Promise<{ hash: string; author: string; date: string; subject: string }[]> {
+  // --follow only works for a single file; git rejects it for directories.
+  let isDir = false;
+  try { isDir = fs.statSync(filePath).isDirectory(); } catch {}
+  const cwd = isDir ? filePath : path.dirname(filePath);
+  const followArgs = isDir ? [] : ["--follow"];
+  const proc = Bun.spawn(
+    ["git", "-C", cwd, "log", ...followArgs, "--date=short",
+     "--format=%H%x1f%an%x1f%ad%x1f%s", "-n", "200", "--", filePath],
+    { stdout: "pipe", stderr: "ignore" },
+  );
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  if (proc.exitCode !== 0) return [];
+  return out.trim().split("\n").filter(Boolean).map((line) => {
+    const [hash = "", author = "", date = "", subject = ""] = line.split("\x1f");
+    return { hash, author, date, subject };
+  });
+}
+
+// Unified diff for a single file at a given commit (the commit's change to that file).
+async function gitShow(filePath: string, hash: string): Promise<string | null> {
+  let isDir = false;
+  try { isDir = fs.statSync(filePath).isDirectory(); } catch {}
+  const cwd = isDir ? filePath : path.dirname(filePath);
+  const proc = Bun.spawn(
+    ["git", "-C", cwd, "show", "--format=", "--no-color", hash, "--", filePath],
+    { stdout: "pipe", stderr: "ignore" },
+  );
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  return proc.exitCode === 0 ? out : null;
+}
+
+// Render a unified diff string as classed, line-per-block HTML.
+function renderDiff(diff: string): string {
+  const lines = diff.replace(/\n$/, "").split("\n").map((line) => {
+    let cls = "";
+    if (line.startsWith("diff ") || line.startsWith("index ")) cls = "d-meta";
+    else if (line.startsWith("+++") || line.startsWith("---")) cls = "d-file";
+    else if (line.startsWith("@@")) cls = "d-hunk";
+    else if (line.startsWith("+")) cls = "d-add";
+    else if (line.startsWith("-")) cls = "d-del";
+    return `<span class="dline ${cls}">${esc(line) || " "}</span>`;
+  });
+  return `<pre class="diff"><code>${lines.join("")}</code></pre>`;
+}
+
 // Inject live-reload script that subscribes to /__reload (optionally with ?path=<abs>)
 function withReload(html: string, reloadUrl: string = "/__reload"): string {
   const liveReload = `<script>
@@ -59,25 +112,28 @@ async function serve(target: string | null, port: number) {
   // Cache rendered pages (plain HTML — reload script injected per-request)
   const cache = new Map<string, { html: string; mtime: number }>();
 
-  async function renderFile(filePath: string): Promise<string> {
+  async function renderFile(filePath: string, view?: string): Promise<string> {
     const stat = fs.statSync(filePath);
-    const cached = cache.get(filePath);
+    const isMd = /\.(md|markdown)$/i.test(filePath);
+    // Default view: markdown → preview, everything else → code.
+    const v = view || (isMd ? "preview" : "code");
+    const cacheKey = `${filePath}\0${v}`;
+    const cached = cache.get(cacheKey);
     if (cached && cached.mtime === stat.mtimeMs) return cached.html;
 
-    const opts = { filePath, daemon: pathMode };
-    const ext = path.extname(filePath).toLowerCase();
+    const opts = { filePath, daemon: pathMode, view: v };
     const text = await Bun.file(filePath).text();
 
     let fullHtml: string;
-    if (ext === ".md" || ext === ".markdown") {
+    if (isMd && v === "preview") {
       const { html, toc, title } = await renderMarkdown(text, opts);
       fullHtml = wrapHtml(html, toc, title, opts);
     } else {
-      // Any other text file → syntax-highlighted code view
+      // Code view: a non-markdown file, or a markdown file's "source" tab.
       const { html, title } = await renderSourceFile(text, filePath);
       fullHtml = wrapHtml(html, [], title, opts);
     }
-    cache.set(filePath, { html: fullHtml, mtime: stat.mtimeMs });
+    cache.set(cacheKey, { html: fullHtml, mtime: stat.mtimeMs });
     return fullHtml;
   }
 
@@ -146,8 +202,9 @@ async function serve(target: string | null, port: number) {
     ".mp4", ".webm", ".mp3", ".wav", ".ogg", ".zip", ".gz", ".wasm",
   ]);
 
-  // absMode → hrefs are the file's real path (daemon path-routing mode), so relative
-  // links inside rendered docs resolve natively; otherwise hrefs are static URL paths.
+  // Returns the directory listing as a body fragment (a `.dirlist` table) — wrapped by
+  // wrapHtml() for shared breadcrumb/tabs/styling. absMode → hrefs are real paths (daemon),
+  // otherwise static URL paths (base-dir serve mode).
   function renderDirectoryListing(dirPath: string, urlPath: string, absMode = false): string {
     const entries = fs.readdirSync(dirPath, { withFileTypes: true });
     // Include dotfiles/dotdirs too.
@@ -176,32 +233,25 @@ async function serve(target: string | null, port: number) {
       rows.push(`<tr><td>${icon}</td><td><a href="${href}">${f.name}</a></td><td>${size}</td><td>${mtime}</td></tr>`);
     }
 
-    // Path breadcrumb (clickable real-path links in daemon/absMode); fall back to a
-    // plain heading for the filesystem root or static base-dir listings.
-    const crumb = absMode ? buildBreadcrumb({ filePath: dirPath, daemon: true }) : "";
-    const header = crumb || `<h1>Index of ${urlPath}</h1>`;
+    return `<table class="dirlist"><thead><tr><th></th><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
+<tbody>${rows.join("\n")}</tbody></table>`;
+  }
 
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Index of ${urlPath}</title>
-<style>
-:root { --bg:#fff; --fg:#1d2331; --muted:#717684; --border:#e5e7eb; --surface:#f9fafb; --link:#2563eb; }
-@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;--border:#30363d;--surface:#161b22;--link:#58a6ff;}}
-body{font-family:system-ui,sans-serif;color:var(--fg);background:var(--bg);max-width:900px;margin:0 auto;padding:2rem 1.5rem;}
-h1{font-size:1.5em;border-bottom:1px solid var(--border);padding-bottom:.3em;}
-.breadcrumb{font-size:.95em;margin-bottom:1.5rem;padding-bottom:.6rem;border-bottom:1px solid var(--border);word-break:break-all;line-height:1.6;}
-.breadcrumb a{color:var(--muted);} .breadcrumb a:hover{color:var(--link);text-decoration:none;}
-.breadcrumb .sep{margin:0 .4em;opacity:.45;} .breadcrumb .crumb-current{color:var(--fg);font-weight:600;}
-table{border-collapse:collapse;width:100%;}
-th,td{text-align:left;padding:.4em .8em;border-bottom:1px solid var(--border);}
-th{background:var(--surface);font-weight:600;font-size:.85em;color:var(--fg);}
-a{color:var(--link);text-decoration:none;} a:hover{text-decoration:underline;}
-td:first-child{width:1.5em;text-align:center;}
-td:nth-child(3),td:nth-child(4){font-size:.85em;color:var(--muted);white-space:nowrap;}
-</style></head><body>
-${header}
-<table><thead><tr><th></th><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
-<tbody>${rows.join("\n")}</tbody></table>
-</body></html>`;
+  // Build the git-history body (htmx-expandable diffs) for a file OR directory.
+  async function historyBody(resolved: string): Promise<string> {
+    const commits = await gitLog(resolved);
+    if (!commits.length) return `<div class="githist"><p class="gh-empty">No git history.</p></div>`;
+    const base = encodeURI(resolved);
+    const htmx = `<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.6/dist/htmx.min.js"></script>`;
+    return `${htmx}<div class="githist"><ol>${commits.map((c) => {
+      const h = esc(c.hash);
+      return `<li><div class="gh-msg">${esc(c.subject)}</div><div class="gh-meta">` +
+        `<button class="gh-difftoggle" hx-get="${base}?view=diff&amp;hash=${h}" ` +
+        `hx-target="#d-${h}" hx-swap="innerHTML" hx-trigger="click once">diff</button>` +
+        `<span class="gh-hash">${esc(c.hash.slice(0, 9))}</span>` +
+        `<span>${esc(c.author)}</span><span>${esc(c.date)}</span></div>` +
+        `<div class="gh-diff" id="d-${h}"></div></li>`;
+    }).join("")}</ol></div>`;
   }
 
   const server = Bun.serve({
@@ -237,17 +287,39 @@ ${header}
       async function serveAbsPath(resolved: string): Promise<Response> {
         if (!fs.existsSync(resolved)) return new Response(`Not found: ${resolved}`, { status: 404 });
         const st = fs.statSync(resolved);
-        if (st.isDirectory()) {
-          const listing = renderDirectoryListing(resolved, resolved, true);
-          return new Response(listing, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        const view = url.searchParams.get("view") || undefined;
+        const reloadUrl = `/__reload?path=${encodeURIComponent(resolved)}`;
+        const htmlPage = (body: string, title: string, v: string) => {
+          const html = wrapHtml(body, [], title, { filePath: resolved, daemon: pathMode, view: v });
+          return new Response(withReload(html, reloadUrl), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        };
+
+        // "Diff" toggle (htmx fragment) → a commit's diff for this file/dir.
+        if (view === "diff") {
+          const hash = url.searchParams.get("hash") || "";
+          if (!/^[0-9a-f]{7,40}$/i.test(hash)) return new Response("bad hash", { status: 400 });
+          const diff = await gitShow(resolved, hash);
+          const frag = diff ? renderDiff(diff) : `<p class="gh-empty">No diff available.</p>`;
+          return new Response(frag, { headers: { "Content-Type": "text/html; charset=utf-8" } });
         }
+
+        // Directories: history view, or the listing (default).
+        if (st.isDirectory()) {
+          if (view === "history") return htmlPage(await historyBody(resolved), path.basename(resolved) || "/", "history");
+          return htmlPage(renderDirectoryListing(resolved, resolved, true), path.basename(resolved) || "/", "files");
+        }
+
+        // Files.
         const ext = path.extname(resolved).toLowerCase();
         if (BINARY_EXTS.has(ext)) {
           return new Response(Bun.file(resolved), { headers: { "Content-Type": MIME_TYPES[ext] || "application/octet-stream" } });
         }
+        if (view === "raw") {
+          return new Response(Bun.file(resolved), { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+        }
+        if (view === "history") return htmlPage(await historyBody(resolved), path.basename(resolved), "history");
         try {
-          const html = await renderFile(resolved);
-          const reloadUrl = `/__reload?path=${encodeURIComponent(resolved)}`;
+          const html = await renderFile(resolved, view);
           return new Response(withReload(html, reloadUrl), { headers: { "Content-Type": "text/html; charset=utf-8" } });
         } catch (e: any) {
           return new Response(`<pre>Error: ${e.message}</pre>`, { status: 500, headers: { "Content-Type": "text/html" } });
@@ -259,9 +331,9 @@ ${header}
         const abs = url.searchParams.get("path");
         if (!abs) {
           return new Response(
-            `<!doctype html><meta charset="utf-8"><title>markdown daemon</title>
+            `<!doctype html><meta charset="utf-8"><title>edita</title>
 <style>body{font-family:system-ui;max-width:720px;margin:3em auto;padding:0 1em;color:#1d2331}code{background:#f6f8fa;padding:1px 4px;border-radius:3px}</style>
-<h1>markdown daemon</h1>
+<h1>edita</h1>
 <p>Open any file directly by its path: <code>http://localhost:${port}/&lt;absolute/path/to/file&gt;</code></p>
 <p>Example: <a href="/etc/hosts">/etc/hosts</a></p>`,
             { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } },
@@ -325,8 +397,9 @@ ${header}
         if (fs.existsSync(indexHtml)) {
           return new Response(Bun.file(indexHtml), { headers: { "Content-Type": "text/html; charset=utf-8" } });
         }
-        // Directory listing
-        const listing = renderDirectoryListing(fsPath, pathname.endsWith("/") ? pathname : pathname + "/");
+        // Directory listing (base-dir serve mode → static URL hrefs)
+        const listingBody = renderDirectoryListing(fsPath, pathname.endsWith("/") ? pathname : pathname + "/");
+        const listing = wrapHtml(listingBody, [], path.basename(fsPath) || "/", { filePath: fsPath, daemon: false });
         return new Response(listing, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
 
