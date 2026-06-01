@@ -19,8 +19,14 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+// Octicons (16px) for the directory listing.
+const FOLDER_SVG = `<svg viewBox="0 0 16 16" width="1em" height="1em" aria-hidden="true"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z"></path></svg>`;
+const FILE_SVG = `<svg viewBox="0 0 16 16" width="1em" height="1em" aria-hidden="true"><path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Zm6.75.062V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z"></path></svg>`;
+
+interface Commit { hash: string; author: string; date: string; reldate: string; subject: string }
+
 // Read a file's git commit history (most recent first; follows renames).
-async function gitLog(filePath: string): Promise<{ hash: string; author: string; date: string; subject: string }[]> {
+async function gitLog(filePath: string): Promise<Commit[]> {
   // --follow only works for a single file; git rejects it for directories.
   let isDir = false;
   try { isDir = fs.statSync(filePath).isDirectory(); } catch {}
@@ -28,16 +34,58 @@ async function gitLog(filePath: string): Promise<{ hash: string; author: string;
   const followArgs = isDir ? [] : ["--follow"];
   const proc = Bun.spawn(
     ["git", "-C", cwd, "log", ...followArgs, "--date=short",
-     "--format=%H%x1f%an%x1f%ad%x1f%s", "-n", "200", "--", filePath],
+     "--format=%H%x1f%an%x1f%ad%x1f%ar%x1f%s", "-n", "200", "--", filePath],
     { stdout: "pipe", stderr: "ignore" },
   );
   const out = await new Response(proc.stdout).text();
   await proc.exited;
   if (proc.exitCode !== 0) return [];
   return out.trim().split("\n").filter(Boolean).map((line) => {
-    const [hash = "", author = "", date = "", subject = ""] = line.split("\x1f");
-    return { hash, author, date, subject };
+    const [hash = "", author = "", date = "", reldate = "", subject = ""] = line.split("\x1f");
+    return { hash, author, date, reldate, subject };
   });
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function formatDate(ymd: string): string {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return (y && m && d) ? `${MONTHS[m - 1]} ${d}, ${y}` : ymd;
+}
+
+interface EntryCommit { author: string; reldate: string; date: string; subject: string }
+
+// Per-entry git metadata for a directory listing (GitHub-style): the last commit that
+// touched each entry, plus the set of git-ignored names. Empty if not a git work tree.
+async function gitDirInfo(dirPath: string, names: string[]): Promise<{ commits: Map<string, EntryCommit>; ignored: Set<string> }> {
+  const commits = new Map<string, EntryCommit>();
+  const ignored = new Set<string>();
+  if (names.length === 0 || names.length > 300) return { commits, ignored };
+  const check = Bun.spawn(["git", "-C", dirPath, "rev-parse", "--is-inside-work-tree"], { stdout: "pipe", stderr: "ignore" });
+  const inside = (await new Response(check.stdout).text()).trim() === "true";
+  await check.exited;
+  if (!inside) return { commits, ignored };
+
+  // Which entries are git-ignored (one batched call; echoes matched names).
+  const ig = Bun.spawn(["git", "-C", dirPath, "check-ignore", ...names], { stdout: "pipe", stderr: "ignore" });
+  const igOut = await new Response(ig.stdout).text();
+  await ig.exited;
+  igOut.trim().split("\n").filter(Boolean).forEach((n) => ignored.add(n));
+
+  // Last commit per tracked entry (skip ignored — git log would be empty anyway).
+  await Promise.all(names.map(async (name) => {
+    if (ignored.has(name)) return;
+    const p = Bun.spawn(
+      ["git", "-C", dirPath, "log", "-1", "--date=short", "--format=%an%x1f%ar%x1f%ad%x1f%s", "--", name],
+      { stdout: "pipe", stderr: "ignore" },
+    );
+    const out = (await new Response(p.stdout).text()).trim();
+    await p.exited;
+    if (out) {
+      const [author = "", reldate = "", date = "", subject = ""] = out.split("\x1f");
+      commits.set(name, { author, reldate, date, subject });
+    }
+  }));
+  return { commits, ignored };
 }
 
 // Unified diff for a single file at a given commit (the commit's change to that file).
@@ -202,10 +250,10 @@ async function serve(target: string | null, port: number) {
     ".mp4", ".webm", ".mp3", ".wav", ".ogg", ".zip", ".gz", ".wasm",
   ]);
 
-  // Returns the directory listing as a body fragment (a `.dirlist` table) — wrapped by
-  // wrapHtml() for shared breadcrumb/tabs/styling. absMode → hrefs are real paths (daemon),
-  // otherwise static URL paths (base-dir serve mode).
-  function renderDirectoryListing(dirPath: string, urlPath: string, absMode = false): string {
+  // Returns the directory listing as a GitHub-style body fragment (a `.ghdir` list) —
+  // wrapped by wrapHtml() for shared breadcrumb/tabs/styling. absMode → hrefs are real
+  // paths (daemon), otherwise static URL paths (base-dir serve mode).
+  async function renderDirectoryListing(dirPath: string, urlPath: string, absMode = false): Promise<string> {
     const entries = fs.readdirSync(dirPath, { withFileTypes: true });
     // Include dotfiles/dotdirs too.
     const dirs = entries.filter(e => e.isDirectory()).sort((a, b) => a.name.localeCompare(b.name));
@@ -214,44 +262,76 @@ async function serve(target: string | null, port: number) {
     const linkFor = (childAbs: string, childUrl: string) =>
       absMode ? encodeURI(childAbs) : childUrl;
 
+    // Last commit per entry + git-ignored set (GitHub-style "who/when edited"); empty if not a git tree.
+    const { commits, ignored } = await gitDirInfo(dirPath, [...dirs, ...files].map(e => e.name));
+
+    const row = (href: string, name: string, isDir: boolean, fallback = "") => {
+      const c = commits.get(name);
+      const isIgnored = ignored.has(name);
+      const cls = `ghdir-row${isIgnored ? " ghdir-ignored" : ""}`;
+      const ico = `<span class="ghdir-ico ghdir-ico-${isDir ? "dir" : "file"}">${isDir ? FOLDER_SVG : FILE_SVG}</span>`;
+      const nm = `<span class="ghdir-name">${esc(name)}</span>`;
+      const mid = c ? `<span class="ghdir-commit">${esc(c.subject)}</span>` : "";
+      const right = c
+        ? `<span class="ghdir-age">${esc(c.author)} · ${esc(c.reldate)}</span>`
+        : (fallback ? `<span class="ghdir-age">${esc(fallback)}</span>` : "");
+      const title = isIgnored ? ` title="git-ignored"`
+        : c ? ` title="${esc(c.author)} committed ${esc(c.date)} — ${esc(c.subject)}"` : "";
+      return `<a class="${cls}" href="${href}"${title}>${ico}${nm}${mid}${right}</a>`;
+    };
+
     const rows: string[] = [];
     if (urlPath !== "/") {
-      const parentAbs = path.dirname(dirPath);
-      const parentUrl = path.dirname(urlPath) || "/";
-      rows.push(`<tr><td>📁</td><td><a href="${linkFor(parentAbs, parentUrl)}">..</a></td><td></td><td></td></tr>`);
+      rows.push(`<a class="ghdir-row" href="${linkFor(path.dirname(dirPath), path.dirname(urlPath) || "/")}">` +
+        `<span class="ghdir-ico ghdir-ico-dir">${FOLDER_SVG}</span><span class="ghdir-name">..</span></a>`);
     }
     for (const d of dirs) {
-      const href = linkFor(path.join(dirPath, d.name), path.join(urlPath, d.name));
-      rows.push(`<tr><td>📁</td><td><a href="${href}">${d.name}/</a></td><td>—</td><td></td></tr>`);
+      rows.push(row(linkFor(path.join(dirPath, d.name), path.join(urlPath, d.name)), d.name, true));
     }
     for (const f of files) {
-      const href = linkFor(path.join(dirPath, f.name), path.join(urlPath, f.name));
       const stat = fs.statSync(path.join(dirPath, f.name));
-      const size = stat.size < 1024 ? `${stat.size} B` : stat.size < 1048576 ? `${(stat.size / 1024).toFixed(1)} KB` : `${(stat.size / 1048576).toFixed(1)} MB`;
-      const mtime = new Date(stat.mtimeMs).toISOString().slice(0, 16).replace("T", " ");
-      const icon = f.name.endsWith(".md") ? "📝" : f.name.endsWith(".html") ? "🌐" : "📄";
-      rows.push(`<tr><td>${icon}</td><td><a href="${href}">${f.name}</a></td><td>${size}</td><td>${mtime}</td></tr>`);
+      const mtime = new Date(stat.mtimeMs).toISOString().slice(0, 10);
+      rows.push(row(linkFor(path.join(dirPath, f.name), path.join(urlPath, f.name)), f.name, false, mtime));
     }
 
-    return `<table class="dirlist"><thead><tr><th></th><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
-<tbody>${rows.join("\n")}</tbody></table>`;
+    return `<div class="ghdir">${rows.join("")}</div>`;
   }
 
-  // Build the git-history body (htmx-expandable diffs) for a file OR directory.
+  // Build the git-history body (GitHub-style, htmx-expandable diffs) for a file OR directory.
   async function historyBody(resolved: string): Promise<string> {
     const commits = await gitLog(resolved);
     if (!commits.length) return `<div class="githist"><p class="gh-empty">No git history.</p></div>`;
     const base = encodeURI(resolved);
     const htmx = `<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.6/dist/htmx.min.js"></script>`;
-    return `${htmx}<div class="githist"><ol>${commits.map((c) => {
-      const h = esc(c.hash);
-      return `<li><div class="gh-msg">${esc(c.subject)}</div><div class="gh-meta">` +
-        `<button class="gh-difftoggle" hx-get="${base}?view=diff&amp;hash=${h}" ` +
-        `hx-target="#d-${h}" hx-swap="innerHTML" hx-trigger="click once">diff</button>` +
-        `<span class="gh-hash">${esc(c.hash.slice(0, 9))}</span>` +
-        `<span>${esc(c.author)}</span><span>${esc(c.date)}</span></div>` +
-        `<div class="gh-diff" id="d-${h}"></div></li>`;
-    }).join("")}</ol></div>`;
+
+    // Group consecutive commits by calendar day.
+    const groups: { date: string; items: Commit[] }[] = [];
+    for (const c of commits) {
+      let g = groups[groups.length - 1];
+      if (!g || g.date !== c.date) { g = { date: c.date, items: [] }; groups.push(g); }
+      g.items.push(c);
+    }
+
+    const groupsHtml = groups.map((g) => {
+      const items = g.items.map((c) => {
+        const h = esc(c.hash);
+        // The whole row is an accordion toggle: htmx lazy-loads the diff once,
+        // ghToggle() expands/collapses (one open at a time).
+        return `<li class="gh-item"><span class="gh-dot"></span><div class="gh-card">` +
+          `<div class="gh-row" hx-get="${base}?view=diff&amp;hash=${h}" hx-target="#d-${h}" ` +
+          `hx-swap="innerHTML" hx-trigger="click once" onclick="ghToggle(this)">` +
+          `<span class="gh-chevron">›</span><div class="gh-main">` +
+          `<div class="gh-msg">${esc(c.subject)}</div>` +
+          `<div class="gh-sub">${esc(c.author)} committed ${esc(c.reldate)}</div>` +
+          `</div><div class="gh-actions"><span class="gh-hash">${esc(c.hash.slice(0, 7))}</span></div>` +
+          `</div><div class="gh-diff" id="d-${h}"></div></div></li>`;
+      }).join("");
+      return `<div class="gh-group"><div class="gh-date">Commits on ${esc(formatDate(g.date))}</div>` +
+        `<ol class="gh-list">${items}</ol></div>`;
+    }).join("");
+
+    const script = `<script>function ghToggle(row){var item=row.closest('.gh-item');var willOpen=!item.classList.contains('open');document.querySelectorAll('.gh-item.open').forEach(function(i){if(i!==item)i.classList.remove('open');});item.classList.toggle('open',willOpen);}</script>`;
+    return `${htmx}${script}<div class="githist">${groupsHtml}</div>`;
   }
 
   const server = Bun.serve({
@@ -306,7 +386,7 @@ async function serve(target: string | null, port: number) {
         // Directories: history view, or the listing (default).
         if (st.isDirectory()) {
           if (view === "history") return htmlPage(await historyBody(resolved), path.basename(resolved) || "/", "history");
-          return htmlPage(renderDirectoryListing(resolved, resolved, true), path.basename(resolved) || "/", "files");
+          return htmlPage(await renderDirectoryListing(resolved, resolved, true), path.basename(resolved) || "/", "files");
         }
 
         // Files.
@@ -398,7 +478,7 @@ async function serve(target: string | null, port: number) {
           return new Response(Bun.file(indexHtml), { headers: { "Content-Type": "text/html; charset=utf-8" } });
         }
         // Directory listing (base-dir serve mode → static URL hrefs)
-        const listingBody = renderDirectoryListing(fsPath, pathname.endsWith("/") ? pathname : pathname + "/");
+        const listingBody = await renderDirectoryListing(fsPath, pathname.endsWith("/") ? pathname : pathname + "/");
         const listing = wrapHtml(listingBody, [], path.basename(fsPath) || "/", { filePath: fsPath, daemon: false });
         return new Response(listing, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
@@ -487,6 +567,7 @@ async function daemonStop() {
   try { fs.unlinkSync(DAEMON_PID_FILE); } catch {}
   try { fs.unlinkSync(DAEMON_PORT_FILE); } catch {}
 }
+
 
 // ── Main ──
 

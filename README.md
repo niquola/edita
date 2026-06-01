@@ -13,8 +13,8 @@ Run one daemon, then point your browser at `http://localhost:3456/<absolute/path
 - **Frontmatter** — leading YAML (`---…---`) is parsed and shown as a tidy metadata card; `title`/`name` set the page title.
 - **Code view** — any non-markdown text file is Shiki-highlighted (30+ languages, dual light/dark theme) with line numbers.
 - **View tabs** — switch a file between **Preview / Source / Raw** (markdown) or **Code / Raw** (code); folders get **Files / History**.
-- **Git history** — files and folders tracked in git get a **History** tab listing commits; each commit expands its diff inline (via htmx, no page reload).
-- **Directory browser** — folder listings with icons, size, mtime, dotfiles, and a path breadcrumb.
+- **Git history** — files and folders tracked in git get a **History** tab: a GitHub-style commit timeline grouped by date, each commit an accordion that expands its diff inline (via htmx, no page reload).
+- **Directory browser** — GitHub-style file list with octicon icons; for git repos each entry shows its **last commit (who / when)**, and git-ignored entries are dimmed.
 - **Breadcrumb** — clickable filesystem path atop every page; git-root folders are marked with a git-branch icon.
 - **Table of contents** — auto-generated from `h2`/`h3`, sticky in a right-hand column.
 - **Live-reload** — per-file SSE; edit on disk and the browser tab refreshes itself.

@@ -401,23 +401,48 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
     }
     .tabs .tab:hover { color: var(--fg); background: var(--surface); text-decoration: none; }
     .tabs .tab.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent); }
-    /* Git history view */
+    /* Git history view — GitHub-style timeline */
     .githist { margin: 0; }
-    .githist ol { list-style: none; padding: 0; margin: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-    .githist li { padding: 0.7em 1em; border-bottom: 1px solid var(--border); }
-    .githist li:last-child { border-bottom: none; }
-    .githist li:nth-child(even) { background: var(--surface); }
-    .githist .gh-msg { font-weight: 600; margin-bottom: 0.2em; }
-    .githist .gh-meta { font-size: 0.85em; color: var(--muted); display: flex; gap: 0.6em; flex-wrap: wrap; align-items: center; }
-    .githist .gh-hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code-bg); padding: 0.05em 0.5em; border-radius: 4px; color: var(--fg); }
     .githist .gh-empty { color: var(--muted); }
-    .githist .gh-difftoggle {
-      cursor: pointer; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px;
-      padding: 0.05em 0.55em; font-size: 0.95em; color: var(--link); font-family: inherit;
+    .githist .gh-group { margin-bottom: 0.5rem; }
+    .githist .gh-date {
+      font-size: 0.85em; font-weight: 600; color: var(--muted);
+      margin: 0 0 0.75rem; padding-left: 2.1em; position: relative; line-height: 1.2;
     }
-    .githist .gh-difftoggle:hover { border-color: var(--link); }
-    .githist .gh-difftoggle.htmx-request { opacity: 0.5; }
-    .githist .gh-diff:not(:empty) { margin-top: 0.6em; }
+    .githist .gh-date::before {
+      content: ""; position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+      width: 10px; height: 10px; border-radius: 2px; background: var(--border);
+    }
+    .githist .gh-list { list-style: none; margin: 0 0 1.25rem; padding: 0; position: relative; }
+    .githist .gh-list::before {
+      content: ""; position: absolute; left: 8px; top: -0.5rem; bottom: -0.75rem; width: 2px; background: var(--border);
+    }
+    .githist .gh-item { position: relative; padding-left: 2.1em; margin-bottom: 0.6rem; }
+    .githist .gh-item:last-child { margin-bottom: 0; }
+    .githist .gh-dot {
+      position: absolute; left: 4px; top: 1.05em; width: 10px; height: 10px; border-radius: 50%;
+      background: var(--bg); border: 2px solid var(--muted); box-sizing: border-box;
+    }
+    .githist .gh-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); overflow: hidden; }
+    .githist .gh-row { display: flex; align-items: flex-start; gap: 0.7em; padding: 0.7em 1em; cursor: pointer; }
+    .githist .gh-row:hover { background: var(--surface); }
+    .githist .gh-chevron { color: var(--muted); transition: transform 0.15s ease; line-height: 1.6; flex-shrink: 0; font-size: 1.1em; }
+    .githist .gh-item.open .gh-chevron { transform: rotate(90deg); }
+    .githist .gh-main { flex: 1 1 auto; min-width: 0; }
+    .githist .gh-msg { font-weight: 600; margin-bottom: 0.15em; word-break: break-word; }
+    .githist .gh-sub { font-size: 0.82em; color: var(--muted); }
+    .githist .gh-actions { display: flex; align-items: center; gap: 0.5em; flex-shrink: 0; }
+    .githist .gh-hash {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8em;
+      background: var(--code-bg); border: 1px solid var(--border); padding: 0.15em 0.55em; border-radius: 6px; color: var(--muted);
+    }
+    .githist .gh-row.htmx-request .gh-chevron { opacity: 0.4; }
+    /* Accordion: diff hidden until the row is opened */
+    .githist .gh-diff { display: none; border-top: 1px solid var(--border); }
+    .githist .gh-item.open .gh-diff { display: block; }
+    .githist .gh-diff .diff { border: none; border-radius: 0; }
+    /* History, code & directory views span the full content width */
+    .layout:has(.githist) .prose, .layout:has(.code-view) .prose, .layout:has(.ghdir) .prose { max-width: none; }
     /* Unified diff rendering */
     .diff { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.5em 0; overflow-x: auto; font-size: 12.5px; line-height: 1.5; margin: 0; }
     .diff .dline { display: block; padding: 0 1em; white-space: pre; }
@@ -425,13 +450,22 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
     .diff .d-del { background: rgba(248,81,73,0.18); }
     .diff .d-hunk { color: var(--accent); }
     .diff .d-file, .diff .d-meta { color: var(--muted); }
-    /* Directory listing */
-    .dirlist { border-collapse: collapse; width: 100%; margin: 0; }
-    .dirlist th, .dirlist td { text-align: left; padding: 0.4em 0.8em; border-bottom: 1px solid var(--border); }
-    .dirlist th { background: var(--surface); font-weight: 600; font-size: 0.85em; }
-    .dirlist tr:nth-child(even) { background: transparent; }
-    .dirlist td:first-child { width: 1.5em; text-align: center; }
-    .dirlist td:nth-child(3), .dirlist td:nth-child(4) { font-size: 0.85em; color: var(--muted); white-space: nowrap; }
+    /* Directory listing — GitHub-style file list */
+    .ghdir { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .ghdir-row { display: flex; align-items: center; gap: 0.6em; padding: 0.5em 1em; border-bottom: 1px solid var(--border); color: var(--fg); text-decoration: none; font-size: 0.95em; }
+    .ghdir-row:last-child { border-bottom: none; }
+    .ghdir-row:hover { background: var(--surface); text-decoration: none; }
+    .ghdir-ico { display: inline-flex; flex-shrink: 0; }
+    .ghdir-ico svg { width: 1.05em; height: 1.05em; vertical-align: middle; }
+    .ghdir-ico-dir svg { fill: var(--accent); }
+    .ghdir-ico-file svg { fill: var(--muted); }
+    .ghdir-name { color: var(--link); flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ghdir-row:hover .ghdir-name { text-decoration: underline; }
+    .ghdir-commit { flex: 1 1 auto; min-width: 0; margin-left: 1.5em; font-size: 0.85em; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ghdir-age { margin-left: auto; font-size: 0.82em; color: var(--muted); white-space: nowrap; padding-left: 1.5em; }
+    /* git-ignored entries are dimmed */
+    .ghdir-ignored { opacity: 0.38; }
+    .ghdir-ignored .ghdir-name { color: var(--muted); }
     /* Two-column layout: content + sticky TOC sidebar on the right */
     .layout { display: flex; gap: 2.5rem; align-items: flex-start; }
     .prose { flex: 1 1 auto; min-width: 0; max-width: 820px; }
@@ -509,8 +543,7 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
     .frontmatter .fm-sub-key {
       font-family: ui-monospace, monospace; font-size: 0.85em; color: var(--muted); font-weight: 600;
     }
-    /* Whole-file code view: widen the column and show line numbers */
-    .layout:has(.code-view) .prose { max-width: none; }
+    /* Whole-file code view: line numbers (full-width handled above) */
     .code-view { margin: 0; }
     .code-view .shiki {
       padding: 1em 0; font-size: 13px; line-height: 1.55;
