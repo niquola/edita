@@ -8,6 +8,7 @@
 import { renderMarkdown, renderSourceFile, wrapHtml, buildBreadcrumb } from "./render";
 import path from "path";
 import fs from "fs";
+import os from "os";
 
 const SCRIPTS_DIR = import.meta.dir;
 const TMP_DIR = `${SCRIPTS_DIR}/tmp`;
@@ -102,6 +103,120 @@ async function gitShow(filePath: string, hash: string): Promise<string | null> {
   return proc.exitCode === 0 ? out : null;
 }
 
+// ── Global review session (~/.edita/review-<ts>.md, agent-readable) ──
+
+const EDITA_HOME = path.join(os.homedir(), ".edita");
+const ACTIVE_PTR = path.join(EDITA_HOME, "active");
+
+interface Note { path: string; start: number; end: number; comment: string }
+
+/** Path of the currently active review file, or null if no review is in progress. */
+function activeReviewFile(): string | null {
+  try {
+    const p = fs.readFileSync(ACTIVE_PTR, "utf8").trim();
+    return p && fs.existsSync(p) ? p : null;
+  } catch { return null; }
+}
+
+/** Begin a new review session → fresh ~/.edita/review-<ts>.md, marked active. */
+function startReview(): string {
+  fs.mkdirSync(EDITA_HOME, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const file = path.join(EDITA_HOME, `review-${ts}.md`);
+  if (!fs.existsSync(file)) fs.writeFileSync(file, `# Review — ${new Date().toISOString()}\n\n`);
+  fs.writeFileSync(ACTIVE_PTR, file);
+  return file;
+}
+
+/** End the active session (keeps the .md file). */
+function stopReview() { try { fs.unlinkSync(ACTIVE_PTR); } catch {} }
+
+/** Append a note (file path + line range + comment) to the active review. */
+async function addReviewNote(file: string, p: string, start: number, end: number, comment: string) {
+  const range = end > start ? `L${start}-${end}` : `L${start}`;
+  const block = `## ${p} ${range}\n${comment.trim()}\n\n`;
+  await Bun.write(file, (await Bun.file(file).text()) + block);
+}
+
+/** Delete the note at `index` (matching readNotes order) and rewrite the .md. */
+async function deleteReviewNote(file: string, index: number) {
+  const notes = readNotes(file);
+  if (index < 0 || index >= notes.length) return;
+  notes.splice(index, 1);
+  const header = (fs.readFileSync(file, "utf8").match(/^# .*\n/)?.[0] ?? "# Review\n") + "\n";
+  const body = notes.map((n) => {
+    const range = n.end > n.start ? `L${n.start}-${n.end}` : `L${n.start}`;
+    return `## ${n.path} ${range}\n${n.comment.trim()}\n\n`;
+  }).join("");
+  await Bun.write(file, header + body);
+}
+
+/** Parse a review .md into notes. */
+function readNotes(file: string | null): Note[] {
+  if (!file || !fs.existsSync(file)) return [];
+  const txt = fs.readFileSync(file, "utf8");
+  return txt.split(/\n(?=## )/).flatMap((block) => {
+    const m = block.match(/^## (.+?) L(\d+)(?:-(\d+))?\n([\s\S]*)$/);
+    if (!m) return [];
+    return [{ path: m[1]!, start: +m[2]!, end: m[3] ? +m[3] : +m[2]!, comment: m[4]!.trim() }];
+  });
+}
+
+function noteRange(n: Note): string { return n.end > n.start ? `L${n.start}–L${n.end}` : `L${n.start}`; }
+
+const CHECKLIST_ICON = `<svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M2.5 1.75v11.5c0 .138.112.25.25.25h3.17a.75.75 0 0 1 0 1.5H2.75A1.75 1.75 0 0 1 1 13.25V1.75C1 .784 1.784 0 2.75 0h8.5C12.216 0 13 .784 13 1.75v7.736a.75.75 0 0 1-1.5 0V1.75a.25.25 0 0 0-.25-.25h-8.5a.25.25 0 0 0-.25.25Zm13.274 9.537-4.557 4.45a.75.75 0 0 1-1.055-.008l-1.943-1.95a.75.75 0 0 1 1.062-1.058l1.419 1.425 4.026-3.932a.75.75 0 1 1 1.048 1.073ZM4.75 4h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM4 7.75A.75.75 0 0 1 4.75 7h2a.75.75 0 0 1 0 1.5h-2A.75.75 0 0 1 4 7.75Z"></path></svg>`;
+
+// Floating review toggle icon (top-right). Off → start; on → finish, with a note-count badge.
+function reviewTopHtml(active: boolean, count: number): string {
+  if (!active) {
+    return `<button class="rv-toggle" title="Start review" data-on-click="@post('/__review/start')">${CHECKLIST_ICON}</button>`;
+  }
+  return `<button class="rv-toggle rv-toggle-on" title="Reviewing — click to finish" data-on-click="@post('/__review/stop')">${CHECKLIST_ICON}<b class="rv-badge" id="rv-count">${count}</b></button>`;
+}
+
+// Right sidebar (review active): line-selection composer + accumulated notes across files.
+function reviewBarHtml(currentFile: string, notes: Note[]): string {
+  const addUrl = `/__review/add?path=${encodeURIComponent(currentFile)}`;
+  const base = esc(path.basename(currentFile));
+  const compose =
+    `<div class="rv-compose" data-show="$rvStart>0">` +
+    `<div class="rv-loc"><span class="rv-loc-file">${base}</span> ` +
+    `<span class="rv-loc-range" data-text="$rvStart==$rvEnd ? ('L'+$rvStart) : ('L'+Math.min($rvStart,$rvEnd)+'–L'+Math.max($rvStart,$rvEnd))"></span></div>` +
+    `<textarea class="rv-text" data-bind="rvComment" placeholder="Note for these lines…"></textarea>` +
+    `<div class="rv-actions">` +
+    `<button class="rv-save" data-on-click="@post('${addUrl}')" data-attr="{disabled: !$rvComment}">Add note</button>` +
+    `<button class="rv-cancel" data-on-click="$rvStart=0;$rvEnd=0;$rvComment=''">Clear</button>` +
+    `</div></div>` +
+    `<p class="rv-hint" data-show="$rvStart==0">Click a line number to attach a note (shift-click to extend the range).</p>`;
+  return `<aside class="review-bar"><div class="rv-bar-h">Review notes</div>${compose}<div class="rv-notes" id="rv-notes">${notesHtml(notes)}</div></aside>`;
+}
+
+// Notes list, grouped by file, with per-note delete — single-line HTML (safe as an SSE fragment).
+function notesHtml(notes: Note[]): string {
+  if (!notes.length) return `<p class="rv-empty">No notes yet.</p>`;
+  // Group by file path, keeping each note's original index (for deletion).
+  const groups = new Map<string, { note: Note; idx: number }[]>();
+  notes.forEach((note, idx) => {
+    if (!groups.has(note.path)) groups.set(note.path, []);
+    groups.get(note.path)!.push({ note, idx });
+  });
+  let out = "";
+  for (const [p, items] of groups) {
+    items.sort((a, b) => a.note.start - b.note.start);
+    out += `<div class="rv-group"><div class="rv-group-h"><a href="${encodeURI(p)}">${esc(path.basename(p))}</a>` +
+      `<span class="rv-group-dir">${esc(path.dirname(p))}</span></div>`;
+    for (const { note, idx } of items) {
+      const comment = esc(note.comment).replace(/\n/g, "<br>");
+      out += `<div class="rv-note"><div class="rv-note-top">` +
+        `<a class="rv-note-loc" href="${encodeURI(p)}#L${note.start}">${noteRange(note)}</a>` +
+        `<button class="rv-del" data-on-click="@post('/__review/del?i=${idx}')" title="Delete note">×</button>` +
+        `</div><div class="rv-note-text">${comment}</div></div>`;
+    }
+    out += `</div>`;
+  }
+  return out;
+}
+
 // Render a unified diff string as classed, line-per-block HTML.
 function renderDiff(diff: string): string {
   const lines = diff.replace(/\n$/, "").split("\n").map((line) => {
@@ -118,8 +233,10 @@ function renderDiff(diff: string): string {
 
 // Inject live-reload script that subscribes to /__reload (optionally with ?path=<abs>)
 function withReload(html: string, reloadUrl: string = "/__reload"): string {
+  // A plain "reload" message reloads; any other payload is a URL to navigate to
+  // (used when the viewed file is deleted → go to its folder instead of 404-reloading).
   const liveReload = `<script>
-new EventSource(${JSON.stringify(reloadUrl)}).onmessage = () => location.reload();
+new EventSource(${JSON.stringify(reloadUrl)}).onmessage = (e) => { if (e.data && e.data !== "reload") location.href = e.data; else location.reload(); };
 </script>`;
   return html.replace("</body>", `${liveReload}\n</body>`);
 }
@@ -160,16 +277,34 @@ async function serve(target: string | null, port: number) {
   // Cache rendered pages (plain HTML — reload script injected per-request)
   const cache = new Map<string, { html: string; mtime: number }>();
 
+  // Review scaffolding shared by every page in daemon mode (top bar always; sidebar when active).
+  function reviewOpts(filePath: string) {
+    if (!pathMode) return { datastar: false } as const;
+    const file = activeReviewFile();
+    const notes = readNotes(file);
+    const active = !!file;
+    return {
+      datastar: true,
+      reviewActive: active,
+      reviewTopHtml: reviewTopHtml(active, notes.length),
+      reviewBarHtml: active ? reviewBarHtml(filePath, notes) : "",
+    };
+  }
+
   async function renderFile(filePath: string, view?: string): Promise<string> {
     const stat = fs.statSync(filePath);
     const isMd = /\.(md|markdown)$/i.test(filePath);
     // Default view: markdown → preview, everything else → code.
     const v = view || (isMd ? "preview" : "code");
+    const rv = reviewOpts(filePath);
+    // Pages can't be cached while a review is active (notes/markers change without mtime).
     const cacheKey = `${filePath}\0${v}`;
-    const cached = cache.get(cacheKey);
-    if (cached && cached.mtime === stat.mtimeMs) return cached.html;
+    if (!rv.reviewActive) {
+      const cached = cache.get(cacheKey);
+      if (cached && cached.mtime === stat.mtimeMs) return cached.html;
+    }
 
-    const opts = { filePath, daemon: pathMode, view: v };
+    const opts = { filePath, daemon: pathMode, view: v, ...rv };
     const text = await Bun.file(filePath).text();
 
     let fullHtml: string;
@@ -177,11 +312,16 @@ async function serve(target: string | null, port: number) {
       const { html, toc, title } = await renderMarkdown(text, opts);
       fullHtml = wrapHtml(html, toc, title, opts);
     } else {
-      // Code view: a non-markdown file, or a markdown file's "source" tab.
-      const { html, title } = await renderSourceFile(text, filePath);
-      fullHtml = wrapHtml(html, [], title, opts);
+      // Code view (non-markdown file, or a markdown file's "source" tab).
+      // In review mode, lines are clickable; lines already noted get a gutter marker.
+      const reviewed = new Set<number>();
+      if (rv.reviewActive) for (const n of readNotes(activeReviewFile())) {
+        if (n.path === filePath) for (let i = n.start; i <= n.end; i++) reviewed.add(i);
+      }
+      const { html: codeHtml, title } = await renderSourceFile(text, filePath, { interactive: !!rv.reviewActive, reviewed });
+      fullHtml = wrapHtml(codeHtml, [], title, opts);
     }
-    cache.set(cacheKey, { html: fullHtml, mtime: stat.mtimeMs });
+    if (!rv.reviewActive) cache.set(cacheKey, { html: fullHtml, mtime: stat.mtimeMs });
     return fullHtml;
   }
 
@@ -196,11 +336,11 @@ async function serve(target: string | null, port: number) {
     }
   }
 
-  function notifyFileClients(filePath: string) {
+  function notifyFileClients(filePath: string, payload = "reload") {
     const set = fileClients.get(filePath);
     if (!set) return;
     for (const c of set) {
-      try { c.enqueue("data: reload\n\n"); } catch { set.delete(c); }
+      try { c.enqueue(`data: ${payload}\n\n`); } catch { set.delete(c); }
     }
   }
 
@@ -212,7 +352,9 @@ async function serve(target: string | null, port: number) {
       const w = fs.watch(dir, (_ev, filename) => {
         if (filename === base) {
           cache.delete(filePath);
-          notifyFileClients(filePath);
+          // Deleted → tell the page to navigate to the folder; otherwise reload in place.
+          if (!fs.existsSync(filePath)) notifyFileClients(filePath, encodeURI(path.dirname(filePath)));
+          else notifyFileClients(filePath);
         }
       });
       fileWatchers.set(filePath, w);
@@ -363,6 +505,75 @@ async function serve(target: string | null, port: number) {
         });
       }
 
+      // Start review → reload so every page enters review mode.
+      if (pathname === "/__review/start" && req.method === "POST") {
+        startReview();
+        return new Response(`event: datastar-execute-script\ndata: script window.location.reload()\n\n`,
+          { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+      }
+      // Finish review → close the session and open the finished review file.
+      if (pathname === "/__review/stop" && req.method === "POST") {
+        const file = activeReviewFile();
+        stopReview();
+        const target = file ? encodeURI(file) : "/";
+        return new Response(`event: datastar-execute-script\ndata: script window.location='${target}'\n\n`,
+          { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+      }
+
+      // Add a note to the active review (Datastar @post) → append to the session .md,
+      // reply with SSE that resets the composer, refreshes the notes list + count.
+      if (pathname === "/__review/add" && req.method === "POST") {
+        const file = activeReviewFile();
+        if (!file) return new Response("no active review", { status: 409 });
+        const abs = url.searchParams.get("path");
+        if (!abs) return new Response("missing path", { status: 400 });
+        const resolved = path.resolve(abs);
+        let sig: any = {};
+        try { const j = await req.json(); sig = j?.datastar ?? j ?? {}; } catch {}
+        const start = Math.max(0, Math.floor(Number(sig.rvStart) || 0));
+        const end = Math.max(start, Math.floor(Number(sig.rvEnd) || start));
+        const comment = String(sig.rvComment ?? "").trim();
+        if (!start || !comment) {
+          return new Response(`event: datastar-merge-signals\ndata: signals {rvComment: ''}\n\n`,
+            { headers: { "Content-Type": "text/event-stream" } });
+        }
+        await addReviewNote(file, resolved, start, end, comment);
+        const notes = readNotes(file);
+        const sse =
+          `event: datastar-merge-signals\ndata: signals {rvStart: 0, rvEnd: 0, rvComment: ''}\n\n` +
+          `event: datastar-merge-fragments\ndata: fragments <div class="rv-notes" id="rv-notes">${notesHtml(notes)}</div>\n\n` +
+          `event: datastar-merge-fragments\ndata: fragments <b class="rv-badge" id="rv-count">${notes.length}</b>\n\n`;
+        return new Response(sse, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+      }
+
+      // Delete a note from the active review by its index.
+      if (pathname === "/__review/del" && req.method === "POST") {
+        const file = activeReviewFile();
+        if (!file) return new Response("no active review", { status: 409 });
+        const i = parseInt(url.searchParams.get("i") || "-1", 10);
+        if (i >= 0) await deleteReviewNote(file, i);
+        const notes = readNotes(file);
+        const sse =
+          `event: datastar-merge-fragments\ndata: fragments <div class="rv-notes" id="rv-notes">${notesHtml(notes)}</div>\n\n` +
+          `event: datastar-merge-fragments\ndata: fragments <b class="rv-badge" id="rv-count">${notes.length}</b>\n\n`;
+        return new Response(sse, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+      }
+
+      // Delete a file (tab-bar trash icon) → unlink, then redirect to the parent directory.
+      if (pathname === "/__delete" && req.method === "POST") {
+        const abs = url.searchParams.get("path");
+        if (!abs) return new Response("missing path", { status: 400 });
+        const resolved = path.resolve(abs);
+        if (!fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) {
+          return new Response("not a file", { status: 400 });
+        }
+        const parent = path.dirname(resolved);
+        try { fs.unlinkSync(resolved); cache.delete(`${resolved}\0code`); cache.delete(`${resolved}\0source`); }
+        catch (e: any) { return new Response(`delete failed: ${e.message}`, { status: 500 }); }
+        return new Response(`event: datastar-execute-script\ndata: script window.location='${encodeURI(parent)}'\n\n`,
+          { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+      }
+
       // Render/serve a file or directory by its real absolute path.
       async function serveAbsPath(resolved: string): Promise<Response> {
         if (!fs.existsSync(resolved)) return new Response(`Not found: ${resolved}`, { status: 404 });
@@ -370,7 +581,7 @@ async function serve(target: string | null, port: number) {
         const view = url.searchParams.get("view") || undefined;
         const reloadUrl = `/__reload?path=${encodeURIComponent(resolved)}`;
         const htmlPage = (body: string, title: string, v: string) => {
-          const html = wrapHtml(body, [], title, { filePath: resolved, daemon: pathMode, view: v });
+          const html = wrapHtml(body, [], title, { filePath: resolved, daemon: pathMode, view: v, ...reviewOpts(resolved) });
           return new Response(withReload(html, reloadUrl), { headers: { "Content-Type": "text/html; charset=utf-8" } });
         };
 

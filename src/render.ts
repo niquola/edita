@@ -28,6 +28,14 @@ export interface RenderOptions {
   daemon?: boolean;
   /** Current view tab — "preview" | "code" | "source" (drives the tab bar highlight). */
   view?: string;
+  /** Global review session is active → render split layout + right sidebar. */
+  reviewActive?: boolean;
+  /** Top menu bar HTML (daemon only) — holds the Start/Finish review control. */
+  reviewTopHtml?: string;
+  /** Right review sidebar HTML (when a review is active). */
+  reviewBarHtml?: string;
+  /** Include the Datastar runtime (needed for review interactivity). */
+  datastar?: boolean;
 }
 
 // ── Shiki highlighter ──
@@ -301,11 +309,37 @@ export function languageForFile(filePath: string): string | undefined {
 }
 
 /** Render a non-markdown source file as a syntax-highlighted code page (with line numbers). */
-export async function renderSourceFile(code: string, filePath: string): Promise<{ html: string; title: string; lang: string }> {
+export interface SourceOpts {
+  /** Wire up Datastar line-selection for code review (daemon mode). */
+  interactive?: boolean;
+  /** 1-based line numbers that already have a review (gutter marker). */
+  reviewed?: Set<number>;
+}
+
+export async function renderSourceFile(code: string, filePath: string, opts: SourceOpts = {}): Promise<{ html: string; title: string; lang: string }> {
   const hl = await getHighlighter();
   const lang = languageForFile(filePath) ?? "plaintext";
   const highlighted = highlightCode(hl, code, lang);
-  const html = `<div class="code-view" data-lang="${escapeHtml(lang)}">${highlighted}</div>`;
+
+  // Pull the Shiki <pre> class/style and split <code> into per-line spans so we can
+  // render an interactive line-number gutter (Shiki keeps token colors inline).
+  const cls = highlighted.match(/<pre[^>]*class="([^"]*)"/)?.[1] ?? "shiki";
+  const style = highlighted.match(/<pre[^>]*style="([^"]*)"/)?.[1] ?? "";
+  const inner = highlighted.replace(/^[\s\S]*?<code[^>]*>/, "").replace(/<\/code>\s*<\/pre>\s*$/, "");
+  const lines = inner.split("\n");
+  const reviewed = opts.reviewed ?? new Set<number>();
+
+  const rows = lines.map((ln, i) => {
+    const n = i + 1;
+    const inter = opts.interactive
+      ? ` data-on-click="evt.shiftKey && $rvStart ? ($rvEnd=${n}) : ($rvStart=${n},$rvEnd=${n})"` +
+        ` data-class="{'cv-sel': $rvStart>0 && ${n}>=Math.min($rvStart,$rvEnd) && ${n}<=Math.max($rvStart,$rvEnd)}"`
+      : "";
+    const mark = reviewed.has(n) ? " cv-reviewed" : "";
+    return `<div class="cv-row${mark}" id="L${n}"${inter}><span class="cv-num">${n}</span><span class="cv-code">${ln || " "}</span></div>`;
+  }).join("");
+
+  const html = `<div class="code-view" data-lang="${escapeHtml(lang)}"><div class="${cls} cv-grid"${style ? ` style="${style}"` : ""}>${rows}</div></div>`;
   return { html, title: path.basename(filePath), lang };
 }
 
@@ -355,6 +389,10 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
 
   const breadcrumbHtml = buildBreadcrumb(opts);
   const tabsHtml = buildTabs(opts);
+  const dsScript = opts.datastar
+    ? `<script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0-beta.11/bundles/datastar.js"></script>`
+    : "";
+  const reviewing = !!opts.reviewActive;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -401,6 +439,9 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
     }
     .tabs .tab:hover { color: var(--fg); background: var(--surface); text-decoration: none; }
     .tabs .tab.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent); }
+    .tabs .tab-actions { margin-left: auto; display: flex; align-items: center; }
+    .tabs .tab-del { cursor: pointer; border: none; background: transparent; color: var(--muted); display: inline-flex; align-items: center; padding: 0.3em 0.4em; border-radius: 6px; margin-bottom: 2px; }
+    .tabs .tab-del:hover { color: #e5484d; background: color-mix(in srgb, #e5484d 12%, transparent); }
     /* Git history view — GitHub-style timeline */
     .githist { margin: 0; }
     .githist .gh-empty { color: var(--muted); }
@@ -543,31 +584,73 @@ export function wrapHtml(body: string, toc: TocItem[], title: string, opts: Rend
     .frontmatter .fm-sub-key {
       font-family: ui-monospace, monospace; font-size: 0.85em; color: var(--muted); font-weight: 600;
     }
-    /* Whole-file code view: line numbers (full-width handled above) */
+    /* Whole-file code view: interactive line-number gutter (full-width handled above) */
     .code-view { margin: 0; }
-    .code-view .shiki {
-      padding: 1em 0; font-size: 13px; line-height: 1.55;
-      border: 1px solid var(--border); overflow-x: auto;
-    }
-    .code-view code { counter-reset: line; display: block; }
-    .code-view .line {
-      display: inline-block; width: 100%; padding: 0 1.5em 0 0;
-    }
-    .code-view .line::before {
-      counter-increment: line; content: counter(line);
-      display: inline-block; width: 3em; margin-right: 1.25em; padding-right: 0.5em;
-      text-align: right; color: var(--muted); opacity: 0.55;
-      border-right: 1px solid var(--border); user-select: none;
-    }
-    .code-view .line:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .code-view .cv-grid { padding: 0.6em 0; font-size: 13px; line-height: 1.55; border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }
+    .code-view .cv-row { display: flex; }
+    .code-view .cv-row:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+    .code-view .cv-num { flex: 0 0 auto; width: 3em; padding: 0 1em 0 0; text-align: right; color: var(--muted); opacity: 0.5; user-select: none; cursor: pointer; }
+    .code-view .cv-row:hover .cv-num { opacity: 0.9; }
+    .code-view .cv-code { white-space: pre; flex: 1 1 auto; padding-right: 1em; }
+    .code-view .cv-sel { background: color-mix(in srgb, var(--accent) 16%, transparent) !important; }
+    .code-view .cv-reviewed .cv-num { color: var(--accent); opacity: 1; font-weight: 600; }
+    .code-view .cv-reviewed .cv-num::after { content: "▌"; margin-left: 0.15em; }
     .katex-display { margin: 1em 0; overflow-x: auto; }
     .shiki { border-radius: 8px; }
     @media (prefers-color-scheme: dark) {
       .shiki, .shiki span { color: var(--shiki-dark) !important; background-color: var(--shiki-dark-bg) !important; }
+      .code-view .cv-grid { color: var(--shiki-dark) !important; background-color: var(--shiki-dark-bg) !important; }
+      .code-view .cv-code span { color: var(--shiki-dark) !important; }
     }
+    /* ── Review mode: top-right toggle icon + right sidebar ── */
+    .rv-toggle {
+      position: fixed; top: 12px; right: 14px; z-index: 70;
+      display: inline-flex; align-items: center; gap: 0.3em; cursor: pointer;
+      width: 34px; height: 34px; justify-content: center; padding: 0;
+      border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--muted);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .rv-toggle:hover { color: var(--fg); border-color: var(--link); }
+    .rv-toggle-on { color: #fff; background: var(--accent); border-color: transparent; width: auto; padding: 0 0.5em; }
+    .rv-badge { font-size: 0.75em; font-weight: 700; font-family: ui-monospace, monospace; }
+    body.reviewing { padding-right: 360px; }
+    .review-bar {
+      position: fixed; top: 0; right: 0; bottom: 0; width: 360px; z-index: 55;
+      background: var(--bg); border-left: 1px solid var(--border); overflow-y: auto; padding: 1em; padding-top: 3.4em;
+    }
+    .rv-bar-h { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; color: var(--muted); margin-bottom: 0.8em; }
+    .rv-compose { border: 1px solid var(--accent); border-radius: 8px; padding: 0.8em; margin-bottom: 1em; background: var(--surface); }
+    .rv-loc { font-size: 0.8em; margin-bottom: 0.5em; }
+    .rv-loc-file { font-weight: 600; }
+    .rv-loc-range { font-family: ui-monospace, monospace; color: var(--accent); }
+    .rv-text { width: 100%; min-height: 5em; resize: vertical; box-sizing: border-box; font-family: inherit; font-size: 0.9em;
+      border: 1px solid var(--border); border-radius: 6px; padding: 0.5em; background: var(--bg); color: var(--fg); }
+    .rv-actions { display: flex; gap: 0.5em; margin-top: 0.6em; }
+    .rv-save { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 0.4em 0.9em; font-size: 0.85em; cursor: pointer; }
+    .rv-save:disabled { opacity: 0.5; cursor: not-allowed; }
+    .rv-cancel { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.4em 0.9em; font-size: 0.85em; cursor: pointer; color: var(--fg); }
+    .rv-hint { color: var(--muted); font-size: 0.85em; margin: 0 0 1em; }
+    .rv-notes { display: flex; flex-direction: column; gap: 1em; }
+    .rv-group-h { font-size: 0.82em; font-weight: 600; margin-bottom: 0.4em; display: flex; flex-direction: column; }
+    .rv-group-h a { color: var(--link); text-decoration: none; }
+    .rv-group-h a:hover { text-decoration: underline; }
+    .rv-group-dir { font-weight: 400; font-size: 0.82em; color: var(--muted); font-family: ui-monospace, monospace; }
+    .rv-group .rv-note { margin-bottom: 0.4em; }
+    .rv-note { border: 1px solid var(--border); border-radius: 8px; padding: 0.5em 0.6em; }
+    .rv-note-top { display: flex; align-items: center; justify-content: space-between; gap: 0.5em; margin-bottom: 0.25em; }
+    .rv-note-loc { font-family: ui-monospace, monospace; font-size: 0.78em; color: var(--accent); text-decoration: none; }
+    .rv-note-loc:hover { text-decoration: underline; }
+    .rv-del { cursor: pointer; border: none; background: transparent; color: var(--muted); font-size: 1.1em; line-height: 1; padding: 0 0.2em; border-radius: 4px; }
+    .rv-del:hover { color: #e5484d; background: color-mix(in srgb, #e5484d 12%, transparent); }
+    .rv-note-text { font-size: 0.88em; white-space: pre-wrap; }
+    .rv-empty { color: var(--muted); font-size: 0.85em; }
+    @media (max-width: 800px) { body.reviewing { padding-right: 0; } .review-bar { position: static; width: auto; border-left: none; border-top: 1px solid var(--border); } }
   </style>
 </head>
-<body>
+<body class="${reviewing ? "reviewing" : ""}">
+${dsScript}
+${opts.reviewTopHtml ?? ""}
+${reviewing ? `<div class="rv-root" data-signals="{rvStart:0,rvEnd:0,rvComment:''}">` : ""}
 ${breadcrumbHtml}
 ${tabsHtml}
 <div class="layout">
@@ -576,6 +659,7 @@ ${body}
 </article>
 ${tocHtml}
 </div>
+${reviewing ? (opts.reviewBarHtml ?? "") + "</div>" : ""}
 </body>
 </html>`;
 }
@@ -614,8 +698,16 @@ function buildTabs(opts: RenderOptions): string {
     return `<a class="tab${active}" href="${href}">${label}</a>`;
   }).join("");
 
-  return `<nav class="tabs">${items}</nav>`;
+  // Delete control (files only), right-aligned on the tab line. Needs Datastar (daemon).
+  const del = !isDir
+    ? `<span class="tab-actions"><button class="tab-del" title="Delete file" ` +
+      `data-on-click="confirm('Delete this file?') && @post('/__delete?path=${encodeURIComponent(opts.filePath)}')">${TRASH_ICON}</button></span>`
+    : "";
+
+  return `<nav class="tabs">${items}${del}</nav>`;
 }
+
+const TRASH_ICON = `<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75ZM4.496 6.675l.66 6.6a.25.25 0 0 0 .249.225h5.19a.25.25 0 0 0 .249-.225l.66-6.6a.75.75 0 0 1 1.492.149l-.66 6.6A1.748 1.748 0 0 1 10.595 15h-5.19a1.75 1.75 0 0 1-1.741-1.575l-.66-6.6a.75.75 0 1 1 1.492-.15ZM6.5 1.75V3h3V1.75a.25.25 0 0 0-.25-.25h-2.5a.25.25 0 0 0-.25.25Z"></path></svg>`;
 
 /** A directory is a git root if it directly contains a `.git` entry. */
 function isGitRoot(dir: string): boolean {
